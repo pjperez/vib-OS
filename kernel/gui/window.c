@@ -1,12 +1,17 @@
 /*
  * Vib-OS - GUI Windowing System
- * 
+ *
  * Complete window manager with compositor and widget toolkit.
  */
 
 #include "types.h"
 #include "printk.h"
 #include "mm/kmalloc.h"
+
+/* Forward declarations for cursor functions */
+static void draw_cursor_at(int x, int y);
+static void save_cursor_background(int x, int y);
+static void restore_cursor_background(void);
 
 /* ===================================================================== */
 /* Display and Color */
@@ -1233,7 +1238,7 @@ void gui_compose(void)
 {
     /* Draw desktop and taskbar */
     draw_desktop();
-    
+
     /* Draw windows from bottom to top (reverse order) */
     /* First, find tail of list */
     struct window *tail = NULL;
@@ -1241,7 +1246,7 @@ void gui_compose(void)
         tail = win;
     }
     (void)tail;
-    
+
     /* Draw from tail to head */
     /* For simplicity, just iterate normally (top window drawn last) */
     struct window *draw_order[MAX_WINDOWS];
@@ -1249,19 +1254,21 @@ void gui_compose(void)
     for (struct window *win = window_stack; win && count < MAX_WINDOWS; win = win->next) {
         draw_order[count++] = win;
     }
-    
+
     /* Draw in reverse (bottom to top) */
     for (int i = count - 1; i >= 0; i--) {
         draw_window(draw_order[i]);
     }
-    
+
+    /* Draw cursor to backbuffer (atomic with the rest of the frame) */
+
     /* Ultra-fast copy backbuffer to framebuffer using unrolled 64-bit transfers */
     if (primary_display.backbuffer && primary_display.framebuffer) {
         uint64_t *src = (uint64_t *)primary_display.backbuffer;
         uint64_t *dst = (uint64_t *)primary_display.framebuffer;
         size_t count64 = (primary_display.pitch * primary_display.height) / 8;
         size_t i = 0;
-        
+
         /* Unrolled copy - 8 qwords (64 bytes / 16 pixels) per iteration */
         size_t fast_count = count64 & ~7UL;  /* Round down to multiple of 8 */
         for (; i < fast_count; i += 8) {
@@ -1278,7 +1285,7 @@ void gui_compose(void)
         for (; i < count64; i++) {
             dst[i] = src[i];
         }
-        
+
         /* Memory barrier to ensure writes are visible before next frame */
         asm volatile("dsb sy" ::: "memory");
     }
@@ -1314,7 +1321,8 @@ static const uint8_t cursor_data[CURSOR_HEIGHT][CURSOR_WIDTH] = {
     {0,0,0,0,0,0,0,1,1,0,0,0},
 };
 
-static int mouse_x = 512, mouse_y = 384;
+/* Mouse position - non-static so gui_compose can access */
+int mouse_x = 512, mouse_y = 384;
 static int mouse_buttons = 0;
 static uint32_t saved_bg[CURSOR_HEIGHT][CURSOR_WIDTH];
 static int saved_x = -1, saved_y = -1;
@@ -1322,16 +1330,17 @@ static int cursor_visible = 0;
 
 static void save_cursor_background(int x, int y)
 {
+    /* Read from BACKBUFFER for consistency */
+    uint32_t *backbuffer = primary_display.backbuffer;
+    if (!backbuffer) return;
+
     for (int row = 0; row < CURSOR_HEIGHT; row++) {
         for (int col = 0; col < CURSOR_WIDTH; col++) {
             int px = x + col;
             int py = y + row;
-            if (px >= 0 && px < (int)primary_display.width && 
+            if (px >= 0 && px < (int)primary_display.width &&
                 py >= 0 && py < (int)primary_display.height) {
-                uint32_t *target = primary_display.framebuffer;
-                if (target) {
-                    saved_bg[row][col] = target[py * (primary_display.pitch / 4) + px];
-                }
+                saved_bg[row][col] = backbuffer[py * (primary_display.pitch / 4) + px];
             }
         }
     }
@@ -1342,17 +1351,18 @@ static void save_cursor_background(int x, int y)
 static void restore_cursor_background(void)
 {
     if (saved_x < 0) return;
-    
+
+    /* Draw to BACKBUFFER for flicker-free rendering */
+    uint32_t *backbuffer = primary_display.backbuffer;
+    if (!backbuffer) return;
+
     for (int row = 0; row < CURSOR_HEIGHT; row++) {
         for (int col = 0; col < CURSOR_WIDTH; col++) {
             int px = saved_x + col;
             int py = saved_y + row;
-            if (px >= 0 && px < (int)primary_display.width && 
+            if (px >= 0 && px < (int)primary_display.width &&
                 py >= 0 && py < (int)primary_display.height) {
-                uint32_t *target = primary_display.framebuffer;
-                if (target) {
-                    target[py * (primary_display.pitch / 4) + px] = saved_bg[row][col];
-                }
+                backbuffer[py * (primary_display.pitch / 4) + px] = saved_bg[row][col];
             }
         }
     }
@@ -1361,20 +1371,21 @@ static void restore_cursor_background(void)
 
 static void draw_cursor_at(int x, int y)
 {
+    /* Draw to BACKBUFFER for flicker-free rendering */
+    uint32_t *backbuffer = primary_display.backbuffer;
+    if (!backbuffer) return;
+
     for (int row = 0; row < CURSOR_HEIGHT; row++) {
         for (int col = 0; col < CURSOR_WIDTH; col++) {
             uint8_t pixel = cursor_data[row][col];
             if (pixel == 0) continue;
-            
+
             int px = x + col;
             int py = y + row;
-            if (px >= 0 && px < (int)primary_display.width && 
+            if (px >= 0 && px < (int)primary_display.width &&
                 py >= 0 && py < (int)primary_display.height) {
                 uint32_t color = (pixel == 1) ? 0x00000000 : 0x00FFFFFF;
-                uint32_t *target = primary_display.framebuffer;
-                if (target) {
-                    target[py * (primary_display.pitch / 4) + px] = color;
-                }
+                backbuffer[py * (primary_display.pitch / 4) + px] = color;
             }
         }
     }
@@ -1462,11 +1473,9 @@ static int prev_buttons = 0;
 
 void gui_handle_mouse_event(int x, int y, int buttons)
 {
-    int prev_x = mouse_x;
-    int prev_y = mouse_y;
     mouse_x = x;
     mouse_y = y;
-    
+
     int left_click = (buttons & 1) && !(prev_buttons & 1);  /* Just pressed */
     int left_held = (buttons & 1);
     int left_release = !(buttons & 1) && (prev_buttons & 1);

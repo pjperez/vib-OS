@@ -259,27 +259,25 @@ static void start_init_process(void)
     input_set_key_callback(keyboard_handler);
     
     printk(KERN_INFO "GUI: Event loop started - type in terminal!\\n");
-    
+
     /* Initial render */
     gui_compose();
-    gui_draw_cursor();
-    
-    /* Main GUI event loop with proper flicker-free refresh */
+
+    /* Main GUI event loop with flicker-free rendering */
     uint32_t frame = 0;
     int last_mx = 0, last_my = 0;
     int last_buttons = 0;
     int needs_redraw = 1;  /* Initial draw */
-    int cursor_only = 0;   /* Only cursor needs updating */
-    
-    /* Timer for periodic auto-refresh (200ms = 5 FPS, flicker-free) */
+
+    /* Timer for periodic auto-refresh (33ms = 30 FPS, smooth animations) */
     extern uint64_t timer_get_ms(void);
     uint64_t last_refresh = timer_get_ms();
-    const uint64_t REFRESH_MS = 200;  /* 5 FPS - smooth, no flicker */
-    
+    const uint64_t REFRESH_MS = 33;  /* 30 FPS - smooth, no flicker */
+
     while (1) {
         /* Poll virtio input devices (keyboard/mouse) - MUST call this! */
         input_poll();
-        
+
         /* Poll for keyboard input from UART as well */
         extern int uart_getc_nonblock(void);
         extern void gui_handle_key_event(int key);
@@ -289,16 +287,16 @@ static void start_init_process(void)
             gui_handle_key_event(c);
             needs_redraw = 1;
         }
-        
+
         /* Poll mouse for position and buttons */
         extern void mouse_get_position(int *x, int *y);
         extern int mouse_get_buttons(void);
         extern void gui_handle_mouse_event(int x, int y, int buttons);
-        
+
         int mx, my;
         mouse_get_position(&mx, &my);
         int mbuttons = mouse_get_buttons();
-        
+
         /* Check if mouse changed */
         if (mx != last_mx || my != last_my || mbuttons != last_buttons) {
             /* Only full redraw on button state change (click/release) or drag */
@@ -306,35 +304,30 @@ static void start_init_process(void)
                 gui_handle_mouse_event(mx, my, mbuttons);
                 needs_redraw = 1;
             } else {
-                /* Just cursor moved - update cursor only */
-                cursor_only = 1;
+                /* Just cursor moved - redraw for cursor update */
+                needs_redraw = 1;
             }
             last_mx = mx;
             last_my = my;
             last_buttons = mbuttons;
         }
-        
-        /* Periodic refresh for animations (5 FPS) */
+
+        /* Periodic refresh for animations (30 FPS) */
         uint64_t now = timer_get_ms();
         if (now - last_refresh >= REFRESH_MS) {
             last_refresh = now;
             needs_redraw = 1;
         }
-        
-        /* Redraw when needed - compose then swap */
+
+        /* Redraw when needed - compose includes everything atomically */
         if (needs_redraw) {
             gui_compose();
-            gui_draw_cursor();
             needs_redraw = 0;
-            cursor_only = 0;
-        } else if (cursor_only) {
-            gui_draw_cursor();
-            cursor_only = 0;
         }
-        
+
         frame++;
         (void)frame;
-        
+
         /* Yield to prevent 100% CPU, allows input polling */
         for (volatile int i = 0; i < 5000; i++) { }
     }
