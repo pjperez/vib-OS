@@ -37,6 +37,7 @@ void gui_handle_mouse_event(int x, int y, int buttons);
 void gui_handle_key_event(int keycode, bool pressed);
 void gui_move_mouse(int dx, int dy);
 void gui_draw_cursor(void);
+void gui_update_mouse_position(int x, int y);
 
 /* ===================================================================== */
 /* Terminal */

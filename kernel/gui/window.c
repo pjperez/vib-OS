@@ -1,18 +1,20 @@
 /*
  * Vib-OS - GUI Windowing System
- * 
+ *
  * Complete window manager with compositor and widget toolkit.
  */
 
 #include "types.h"
 #include "printk.h"
 #include "mm/kmalloc.h"
-#include "../core/process.h"  /* For Doom launch */
-#include "icons.h"            /* Icon bitmaps */
-#include "fs/vfs.h"        /* VFS headers */
 
-struct window *gui_create_file_manager(int x, int y);
-void gui_open_notepad(const char *path);
+/* Forward declarations for cursor functions */
+static void draw_cursor_at(int x, int y);
+static void save_cursor_background(int x, int y);
+static void restore_cursor_background(void);
+
+/* Mouse position - global for cursor drawing */
+int mouse_x = 512, mouse_y = 384;
 
 /* ===================================================================== */
 /* Display and Color */
@@ -98,13 +100,7 @@ static void calc_button_click(char key)
 /* Notepad state (global for keyboard input) */
 #define NOTEPAD_MAX_TEXT 2048
 static char notepad_text[NOTEPAD_MAX_TEXT];
-static char notepad_filepath[256]; /* Track open file */
 static int notepad_cursor = 0;
-
-/* Rename State */
-static char rename_text[256];
-static char rename_path[512];
-static int rename_cursor = 0;
 
 /* Terminal state (global for keyboard input) */
 #define TERM_INPUT_MAX 256
@@ -127,20 +123,6 @@ static int snake_food_x = 10;
 static int snake_food_y = 6;
 static int snake_score = 0;
 static int snake_game_over = 0;
-
-/* Mouse state (global for hover effects) */
-static int mouse_x = 512, mouse_y = 384;
-static int mouse_buttons = 0;
-
-/* Trig tables for Clock (fixed point 8.8, scale 256) */
-/* 0..59 corresponds to 0..360 degrees clockwise from top */
-/* x = sin(angle), y = -cos(angle) */
-static const int clock_sin[60] = {
-    0, 26, 53, 79, 104, 128, 150, 171, 189, 205, 219, 231, 240, 248, 253, 256, 253, 248, 240, 231, 219, 205, 189, 171, 150, 128, 104, 79, 53, 26, 0, -26, -53, -79, -104, -128, -150, -171, -189, -205, -219, -231, -240, -248, -253, -256, -253, -248, -240, -231, -219, -205, -189, -171, -150, -128, -104, -79, -53, -26
-};
-static const int clock_cos[60] = {
-    -256, -253, -248, -240, -231, -219, -205, -189, -171, -150, -128, -104, -79, -53, -26, 0, 26, 53, 79, 104, 128, 150, 171, 189, 205, 219, 231, 240, 248, 253, 256, 253, 248, 240, 231, 219, 205, 189, 171, 150, 128, 104, 79, 53, 26, 0, -26, -53, -79, -104, -128, -150, -171, -189, -205, -219, -231, -240, -248, -253
-};
 
 /* Initialize snake game */
 static void snake_init(void)
@@ -256,21 +238,6 @@ static void notepad_key(int key)
     }
 }
 
-static void rename_key(int key)
-{
-    if (key == '\b' || key == 127) {  /* Backspace */
-        if (rename_cursor > 0) {
-            rename_cursor--;
-            rename_text[rename_cursor] = '\0';
-        }
-    } else if (key >= 32 && key < 127) {  /* Printable */
-        if (rename_cursor < 255) {
-            rename_text[rename_cursor++] = (char)key;
-            rename_text[rename_cursor] = '\0';
-        }
-    }
-}
-
 /* Terminal key handler */
 static void terminal_key(int key)
 {
@@ -319,6 +286,9 @@ struct display {
     uint32_t bpp;
     uint32_t *framebuffer;
     uint32_t *backbuffer;
+    uint32_t frame_counter;
+    uint32_t last_present_counter;
+    bool vsync_enabled;
 };
 
 static struct display primary_display = {0};
@@ -616,348 +586,8 @@ static void draw_circle(int cx, int cy, int r, uint32_t color)
 }
 
 /* Draw a single window */
-/* ===================================================================== */
-/* Render Helpers */
-/* ===================================================================== */
-
-extern struct file *vfs_open(const char *path, int flags, mode_t mode);
-extern int vfs_close(struct file *file);
-extern int vfs_readdir(struct file *file, void *ctx, int (*filldir)(void *, const char *, int, loff_t, ino_t, unsigned));
-
-/* Forward declaration */
-/* Helper for string compare */
-static int str_cmp(const char *s1, const char *s2)
-{
-    while (*s1 && (*s1 == *s2)) {
-        s1++; s2++;
-    }
-    return *(const unsigned char*)s1 - *(const unsigned char*)s2;
-}
-
-static void draw_icon(int x, int y, int size, const unsigned char *icon, uint32_t fg_color, uint32_t bg_color);
-
-
-struct fm_state {
-    char path[256];
-    char selected[256];
-    int scroll_y;
-};
-
-/* Context for finding clicked item */
-struct find_ctx {
-    int target_slot_x;
-    int target_slot_y;
-    int cur_x;
-    int cur_y;
-    int start_x;
-    int cur_slot;
-    struct fm_state *st;
-    int clicked;
-    int click_x, click_y;
-    int slot_w, slot_h;
-    int win_w;
-};
-
-static int find_callback(void *ctx, const char *name, int len, loff_t off, ino_t ino, unsigned type) {
-    (void)off;
-    (void)ino;
-    struct find_ctx *fc = (struct find_ctx *)ctx;
-    if (fc->clicked) return 0;
-    
-    if (name[0] == '.') return 0;
-    
-    /* Check if click is in this slot */
-    if (fc->click_x >= fc->cur_x && fc->click_x < fc->cur_x + fc->slot_w &&
-        fc->click_y >= fc->cur_y && fc->click_y < fc->cur_y + fc->slot_h) {
-        
-        /* HIT! */
-        fc->clicked = 1;
-        
-        /* Handle selection */
-        int i;
-        for(i=0; i<len && i<255; i++) fc->st->selected[i] = name[i];
-        fc->st->selected[i] = '\0';
-        
-        /* Handle Double Click (Primitive: if already selected, enter) */
-        if (type == 4) { /* Directory */
-            /* Append path */
-            int plen = 0; while(fc->st->path[plen]) plen++;
-            /* Check if path ends in / */
-            int need_slash = (plen > 0 && fc->st->path[plen-1] != '/');
-            if (plen + len + need_slash + 1 < 256) {
-                if (need_slash) fc->st->path[plen++] = '/';
-                for(i=0; i<len; i++) fc->st->path[plen++] = name[i];
-                fc->st->path[plen] = '\0';
-                fc->st->selected[0] = '\0';
-            }
-        }
-        return 1; /* Stop */
-    }
-    
-    /* Advance */
-    fc->cur_x += fc->slot_w;
-    if (fc->cur_x + fc->slot_w > fc->start_x + fc->win_w) {
-        fc->cur_x = fc->start_x;
-        fc->cur_y += fc->slot_h;
-    }
-    return 0;
-}
-
-struct fm_ctx {
-    struct window *win;
-    int x, y;
-    int start_x, start_y;
-    int cur_x, cur_y;
-    struct fm_state *state;
-};
-
-static int fm_render_callback(void *ctx, const char *name, int len, loff_t offset, ino_t ino, unsigned type)
-{
-    (void)offset;
-    (void)ino;
-    struct fm_ctx *c = (struct fm_ctx *)ctx;
-    
-    /* Skip . and .. */
-    if (name[0] == '.') return 0;
-    
-    int icon_size = 32;
-    int slot_w = 80;
-    int slot_h = 70;
-    
-    int dx = c->cur_x;
-    int dy = c->cur_y;
-    
-    /* Select icon */
-    /* Check for known extensions or just file vs dir */
-    /* Simple check: type (DT_DIR included in ramfs.c as shifted mode) */
-    /* VFS readdir passes mode >> 12. S_IFDIR is 0040000. >> 12 is 4. */
-    /* S_IFREG is 0100000. >> 12 is 8 (010). */
-    
-    const unsigned char *bmp = icon_notepad; /* Default file */
-    uint32_t color = 0xCCCCCC;
-    
-    /* S_IFDIR >> 12 is 4 */
-    if (type == 4) {
-        bmp = icon_files; /* Folder icon */
-        color = 0x3B82F6;
-    } else {
-        /* Check extension */
-        if (len > 4 && name[len-4] == '.' && name[len-3] == 't' && name[len-2] == 'x' && name[len-1] == 't') {
-            bmp = icon_notepad;
-            color = 0xFFFFFF;
-        }
-    }
-    
-    /* Check if selected */
-    int is_selected = 0;
-    if (c->state && str_cmp(c->state->selected, name) == 0) {
-        is_selected = 1;
-    }
-    
-    /* Selection Box */
-    if (is_selected) {
-        gui_draw_rect(dx + 2, dy + 2, slot_w - 4, slot_h - 4, 0x404050);
-        gui_draw_rect_outline(dx + 2, dy + 2, slot_w - 4, slot_h - 4, 0x606080, 1);
-    }
-    
-    /* Draw Icon */
-    draw_icon(dx + (slot_w - icon_size)/2, dy + 8, icon_size, bmp, color, is_selected ? 0x404050 : 0x1E1E2E);
-    
-    /* Draw Label */
-    int lbl_len = len > 10 ? 10 : len;
-    char lbl[12];
-    for(int i=0; i<lbl_len; i++) lbl[i] = name[i];
-    lbl[lbl_len] = '\0';
-    
-    /* Center text */
-    gui_draw_string(dx + (slot_w - lbl_len*8)/2, dy + icon_size + 12, lbl, 0xFFFFFF, is_selected ? 0x404050 : 0x1E1E2E);
-    
-    /* Advance position */
-    c->cur_x += slot_w;
-    if (c->cur_x + slot_w > c->start_x + c->win->width - 40) {
-        c->cur_x = c->start_x;
-        c->cur_y += slot_h;
-    }
-    
-    return 0;
-}
-
-/* File Manager Mouse Handler */
-static void fm_on_mouse(struct window *win, int x, int y, int buttons)
-{
-    struct fm_state *st = (struct fm_state *)win->userdata;
-    (void)buttons;
-    if (!st) return;
-    
-    /* Handle Toolbar Clicks */
-    int toolbar_h = 40;
-    
-    /* Toolbar is drawn below titlebar */
-    /* Relative Y: BORDER_WIDTH + TITLEBAR_HEIGHT */
-    int tb_start_y = BORDER_WIDTH + TITLEBAR_HEIGHT;
-    int tb_end_y = tb_start_y + toolbar_h;
-    
-    if (y >= tb_start_y && y < tb_end_y) {
-        /* Back Button: x relative to window = BORDER_WIDTH + 10 */
-        if (x >= BORDER_WIDTH + 10 && x < BORDER_WIDTH + 70) {
-            /* Go to parent */
-            int len = 0; while(st->path[len]) len++;
-            if (len > 1) { /* Not root */
-                while(len > 0 && st->path[len-1] != '/') len--;
-                
-                /* If we found the root slash at index 0 (len=1), keep it. */
-                /* If we found a slash elsewhere (len>1), remove it (len--). */
-                if (len > 1) len--;
-                
-                st->path[len] = '\0';
-                st->selected[0] = '\0';
-                if (len == 0) { st->path[0]='/'; st->path[1]='\0'; }
-            }
-        }
-        
-        /* New Folder: 80px offset */
-        if (x >= BORDER_WIDTH + 80 && x < BORDER_WIDTH + 180) {
-            /* Create "NewFolder" */
-            char new_path[512];
-            int p_len = 0; 
-            while(st->path[p_len]) {
-                new_path[p_len] = st->path[p_len];
-                p_len++;
-            }
-            if (new_path[p_len-1] != '/') {
-                new_path[p_len] = '/';
-                p_len++;
-            }
-            
-            const char *base = "NewFolder";
-            for(int i=0; base[i]; i++) {
-                new_path[p_len] = base[i];
-                p_len++;
-            }
-            new_path[p_len] = '\0';
-            
-            /* Try to create */
-            extern int vfs_mkdir(const char *path, mode_t mode);
-            vfs_mkdir(new_path, 0755);
-        }
-        
-        /* New File: 190px offset */
-        if (x >= BORDER_WIDTH + 190 && x < BORDER_WIDTH + 280) {
-            /* Create "NewFile.txt" */
-            /* ... (existing logic) ... */
-            char new_path[512];
-            int p_len = 0; 
-            while(st->path[p_len]) {
-                new_path[p_len] = st->path[p_len];
-                p_len++;
-            }
-            if (new_path[p_len-1] != '/') {
-                new_path[p_len] = '/';
-                p_len++;
-            }
-            
-            const char *base = "NewFile.txt";
-            for(int i=0; base[i]; i++) {
-                new_path[p_len] = base[i];
-                p_len++;
-            }
-            new_path[p_len] = '\0';
-            
-            /* Try to create */
-            extern int vfs_create(const char *path, mode_t mode);
-            vfs_create(new_path, 0644);
-        }
-
-        /* Rename: 290px offset */
-        if (x >= BORDER_WIDTH + 290 && x < BORDER_WIDTH + 380) {
-            if (st->selected[0]) {
-                /* Build full path */
-                char full_path[512];
-                int idx = 0;
-                int p_len = 0; while(st->path[p_len]) { full_path[idx++] = st->path[p_len++]; }
-                if (idx > 0 && full_path[idx-1] != '/') full_path[idx++] = '/';
-                else if (idx == 0) full_path[idx++] = '/'; 
-                
-                int s_len = 0; while(st->selected[s_len]) { full_path[idx++] = st->selected[s_len++]; }
-                full_path[idx] = '\0';
-                
-                extern void gui_open_rename(const char *path);
-                gui_open_rename(full_path);
-            }
-        }
-        
-        return;
-    }
-    
-    /* Handle Grid Clicks */
-    struct file *dir = vfs_open(st->path, O_RDONLY, 0);
-    if (!dir) return;
-    
-    /* Grid Clicks */
-    /* Content starts below toolbar */
-    int content_x = BORDER_WIDTH + 10;
-    int content_y = BORDER_WIDTH + TITLEBAR_HEIGHT + 40 + 10;
-    
-    struct find_ctx fctx;
-    fctx.cur_x = content_x;
-    fctx.cur_y = content_y;
-    fctx.start_x = content_x; 
-    fctx.st = st;
-    fctx.clicked = 0;
-    fctx.click_x = x;
-    fctx.click_y = y;
-    
-    /* Initialize dimensions */
-    fctx.slot_w = 80;
-    fctx.slot_h = 70;
-    fctx.win_w = win->width - 40; /* Match wrapped logic in render callback */
-    fctx.slot_w = 80;
-    fctx.slot_h = 70;
-    fctx.win_w = win->width - 40;
-    
-    extern int vfs_readdir(struct file *file, void *ctx, int (*filldir)(void *, const char *, int, loff_t, ino_t, unsigned));
-    vfs_readdir(dir, &fctx, find_callback);
-    
-    vfs_close(dir);
-    
-    if (fctx.clicked) {
-        /* Check if it's a file (.txt) */
-        int len = 0; while(st->selected[len]) len++;
-        
-        if (len > 4 && st->selected[len-4] == '.' && st->selected[len-3] == 't' && 
-            st->selected[len-2] == 'x' && st->selected[len-1] == 't') {
-            
-            /* Build full path */
-            char full_path[512];
-            int idx = 0;
-            int p_len = 0; while(st->path[p_len]) { full_path[idx++] = st->path[p_len++]; }
-            if (idx > 0 && full_path[idx-1] != '/') full_path[idx++] = '/';
-            else if (idx == 0) full_path[idx++] = '/'; 
-            
-            int s_len = 0; while(st->selected[s_len]) { full_path[idx++] = st->selected[s_len++]; }
-            full_path[idx] = '\0';
-            
-            /* Open in Notepad */
-            gui_open_notepad(full_path);
-        } else {
-            /* Directory - Navigate */
-            int p_len = 0; while(st->path[p_len]) p_len++;
-            if (st->path[p_len-1] != '/') {
-                st->path[p_len++] = '/';
-            }
-            int s_len = 0; while(st->selected[s_len]) {
-                st->path[p_len++] = st->selected[s_len++];
-            }
-            st->path[p_len] = '\0';
-            st->selected[0] = '\0';
-        }
-    }
-}
-
-
 static void draw_window(struct window *win)
 {
-    // ... rest of function ...
     if (!win->visible) return;
     
     int x = win->x, y = win->y;
@@ -1066,56 +696,16 @@ static void draw_window(struct window *win)
     }
     /* File Manager */
     else if (win->title[0] == 'F' && win->title[1] == 'i' && win->title[2] == 'l') {
-        int yy = content_y;
-        int toolbar_h = 40;
-        
-        /* Toolbar */
-        gui_draw_rect(content_x, yy, content_w, toolbar_h, 0x2A2A35);
-        gui_draw_line(content_x, yy + toolbar_h, content_x + content_w, yy + toolbar_h, 0x404050);
-        
-        /* Back Button */
-        gui_draw_rect(content_x + 10, yy + 8, 60, 24, 0x404050);
-        gui_draw_string(content_x + 22, yy + 12, "Back", 0xFFFFFF, 0x404050);
-        
-        /* New Folder Button */
-        gui_draw_rect(content_x + 80, yy + 8, 100, 24, 0x404050);
-        gui_draw_string(content_x + 90, yy + 12, "New Folder", 0xFFFFFF, 0x404050);
-        
-        /* New File Button */
-        gui_draw_rect(content_x + 190, yy + 8, 90, 24, 0x404050);
-        gui_draw_string(content_x + 200, yy + 12, "New File", 0xFFFFFF, 0x404050);
-
-        /* Rename Button */
-        gui_draw_rect(content_x + 290, yy + 8, 90, 24, 0x404050);
-        gui_draw_string(content_x + 300, yy + 12, "Rename", 0xFFFFFF, 0x404050);
-        
-        yy += toolbar_h;
-        
-        struct fm_state *st = (struct fm_state *)win->userdata;
-        const char *path = st ? st->path : "/";
-        
-        gui_draw_string(content_x + 10, yy + 4, "Location:", 0xAAAAAA, THEME_BG);
-        gui_draw_string(content_x + 90, yy + 4, path, 0xFFFFFF, THEME_BG);
-        
-        yy += 20;
-        
-        /* Grid container */
-        struct fm_ctx ctx;
-        ctx.win = win;
-        ctx.start_x = content_x + 10;
-        ctx.start_y = yy;
-        ctx.cur_x = ctx.start_x;
-        ctx.cur_y = ctx.start_y;
-        ctx.state = st;
-        
-        /* Open VFS */
-        struct file *dir = vfs_open(path, O_RDONLY, 0);
-        if (dir) {
-            vfs_readdir(dir, &ctx, fm_render_callback);
-            vfs_close(dir);
-        } else {
-            gui_draw_string(content_x + 20, yy + 20, "Failed to open directory", 0xFF0000, 0x1E1E2E);
-        }
+        gui_draw_string(content_x + 10, content_y + 10, "/ (Root Directory)", 0xCDD6F4, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 32, "bin/", 0x89B4FA, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 52, "etc/", 0x89B4FA, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 72, "home/", 0x89B4FA, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 92, "lib/", 0x89B4FA, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 112, "proc/", 0x89B4FA, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 132, "sys/", 0x89B4FA, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 152, "tmp/", 0x89B4FA, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 172, "usr/", 0x89B4FA, THEME_BG);
+        gui_draw_string(content_x + 20, content_y + 192, "var/", 0x89B4FA, THEME_BG);
     }
     /* Paint */
     else if (win->title[0] == 'P' && win->title[1] == 'a') {
@@ -1129,39 +719,6 @@ static void draw_window(struct window *win)
         gui_draw_rect(content_x + 272, content_y + 4, 20, 20, 0x000000);
         /* Canvas */
         gui_draw_rect(content_x + 4, content_y + 36, content_w - 8, content_h - 44, 0xFFFFFF);
-    }
-    /* Browser */
-    else if (win->title[0] == 'B' && win->title[1] == 'r' && win->title[2] == 'o') {
-        /* Toolbar Background */
-        gui_draw_rect(content_x, content_y, content_w, 40, 0xDDDDDD);
-        
-        /* Address Bar */
-        gui_draw_rect(content_x + 80, content_y + 8, content_w - 96, 24, 0xFFFFFF);
-        gui_draw_rect_outline(content_x + 80, content_y + 8, content_w - 96, 24, 0xA0A0A0, 1);
-        gui_draw_string(content_x + 88, content_y + 12, "http://vib-os.org", 0x333333, 0xFFFFFF);
-        
-        /* Navigation Buttons */
-        gui_draw_string(content_x + 12, content_y + 12, "<", 0x555555, 0xDDDDDD);
-        gui_draw_string(content_x + 35, content_y + 12, ">", 0x555555, 0xDDDDDD);
-        gui_draw_string(content_x + 58, content_y + 12, "@", 0x555555, 0xDDDDDD); /* Refresh */
-        
-        /* Web Content Area */
-        gui_draw_rect(content_x, content_y + 40, content_w, content_h - 40, 0xFFFFFF);
-        
-        /* Mock Page Content */
-        gui_draw_string(content_x + 20, content_y + 60, "Welcome to VibBrowser", 0x000000, 0xFFFFFF);
-        gui_draw_rect(content_x + 20, content_y + 78, 200, 2, 0x007AFF); /* Underline */
-        
-        gui_draw_string(content_x + 20, content_y + 90, "Status:", 0x555555, 0xFFFFFF);
-        gui_draw_string(content_x + 80, content_y + 90, "Networking Enabled", 0x00AA00, 0xFFFFFF);
-        
-        gui_draw_string(content_x + 20, content_y + 110, "IP Addr:", 0x555555, 0xFFFFFF);
-        gui_draw_string(content_x + 80, content_y + 110, "10.0.2.15 (DHCP)", 0x333333, 0xFFFFFF);
-        
-        /* Fake links */
-        gui_draw_string(content_x + 20, content_y + 150, "- Latest News", 0x007AFF, 0xFFFFFF);
-        gui_draw_string(content_x + 20, content_y + 170, "- Documentation", 0x007AFF, 0xFFFFFF);
-        gui_draw_string(content_x + 20, content_y + 190, "- Source Code", 0x007AFF, 0xFFFFFF);
     }
     /* Help */
     else if (win->title[0] == 'H' && win->title[1] == 'e') {
@@ -1391,30 +948,19 @@ static void draw_window(struct window *win)
             gui_draw_rect(tx, yy, 8, 16, 0xCDD6F4);
         }
     }
-    /* Notepad & Rename */
-    else if ((win->title[0] == 'N' && win->title[1] == 'o' && win->title[2] == 't') ||
-             (win->title[0] == 'R' && win->title[1] == 'e' && win->title[2] == 'n')) {
-        /* Toolbar */
-        gui_draw_rect(content_x, content_y, content_w, 30, 0xDDDDDD);
-        
-        /* Save Button */
-        gui_draw_rect(content_x + 10, content_y + 4, 60, 22, 0x585B70);
-        gui_draw_string(content_x + 20, content_y + 8, "Save", 0xFFFFFF, 0x585B70);
-        
+    /* Notepad */
+    else if (win->title[0] == 'N' && win->title[1] == 'o' && win->title[2] == 't') {
         /* Text editing area */
-        gui_draw_rect(content_x + 4, content_y + 34, content_w - 8, content_h - 38, 0xFFFFFF);
+        gui_draw_rect(content_x + 4, content_y + 4, content_w - 8, content_h - 8, 0xFFFFFF);
         
         /* Draw text with wrapping */
         int tx = content_x + 8;
-        int ty = content_y + 38;
+        int ty = content_y + 8;
         int max_x = content_x + content_w - 12;
         int max_y = content_y + content_h - 20;
         
-        char *target_text = (win->title[0] == 'N') ? notepad_text : rename_text;
-        int target_cursor = (win->title[0] == 'N') ? notepad_cursor : rename_cursor;
-        
-        for (int i = 0; i < target_cursor && ty < max_y; i++) {
-            char c = target_text[i];
+        for (int i = 0; i < notepad_cursor && ty < max_y; i++) {
+            char c = notepad_text[i];
             if (c == '\n') {
                 tx = content_x + 8;
                 ty += 16;
@@ -1429,122 +975,9 @@ static void draw_window(struct window *win)
         }
         
         /* Cursor */
-        /* Cursor */
-        if (win->focused) {
-            gui_draw_rect(tx, ty, 2, 14, 0x000000);
+        if (ty < max_y) {
+            gui_draw_rect(tx, ty, 2, 16, 0x000000);
         }
-    }
-    /* Snake Game */
-    else if (win->title[0] == 'S' && win->title[1] == 'n' && win->title[2] == 'a') {
-        /* Calculate cell size based on content area */
-        int cell_w = (content_w - 20) / SNAKE_GRID_W;
-        int cell_h = (content_h - 40) / SNAKE_GRID_H;
-        if (cell_w > cell_h) cell_w = cell_h;
-        else cell_h = cell_w;
-        
-        int grid_x = content_x + (content_w - cell_w * SNAKE_GRID_W) / 2;
-        int grid_y = content_y + 30;
-        
-        /* Draw score */
-        char score_str[32];
-        int si = 0;
-        score_str[si++] = 'S';
-        score_str[si++] = 'c';
-        score_str[si++] = 'o';
-        score_str[si++] = 'r';
-        score_str[si++] = 'e';
-        score_str[si++] = ':';
-        score_str[si++] = ' ';
-        int s = snake_score;
-        if (s == 0) score_str[si++] = '0';
-        else {
-            char tmp[8]; int ti = 0;
-            while (s > 0) { tmp[ti++] = '0' + (s % 10); s /= 10; }
-            while (ti > 0) score_str[si++] = tmp[--ti];
-        }
-        score_str[si] = '\0';
-        gui_draw_string(content_x + 10, content_y + 8, score_str, 0xF9E2AF, THEME_BG);
-        
-        /* Draw grid background */
-        gui_draw_rect(grid_x - 2, grid_y - 2, cell_w * SNAKE_GRID_W + 4, 
-                      cell_h * SNAKE_GRID_H + 4, 0x1E1E2E);
-        
-        /* Draw snake body */
-        for (int i = 0; i < snake_len; i++) {
-            int sx = grid_x + snake_x[i] * cell_w + 1;
-            int sy = grid_y + snake_y[i] * cell_h + 1;
-            uint32_t color = (i == 0) ? 0x94E2D5 : 0xA6E3A1; /* Head vs body */
-            gui_draw_rect(sx, sy, cell_w - 2, cell_h - 2, color);
-        }
-        
-        /* Draw food */
-        int fx = grid_x + snake_food_x * cell_w + 1;
-        int fy = grid_y + snake_food_y * cell_h + 1;
-        gui_draw_rect(fx, fy, cell_w - 2, cell_h - 2, 0xF38BA8);
-        
-        /* Game over message */
-        if (snake_game_over) {
-            gui_draw_string(content_x + content_w/2 - 40, content_y + content_h - 30,
-                           "GAME OVER!", 0xF38BA8, THEME_BG);
-            gui_draw_string(content_x + content_w/2 - 60, content_y + content_h - 14,
-                           "Press R to restart", 0x6C7086, THEME_BG);
-        } else {
-            gui_draw_string(content_x + 10, content_y + content_h - 14,
-                           "Arrow keys to move", 0x6C7086, THEME_BG);
-        }
-        }
-    /* Clock */
-    else if (win->title[0] == 'C' && win->title[1] == 'l' && win->title[2] == 'o') {
-        int cx = content_x + content_w / 2;
-        int cy = content_y + content_h / 2;
-        int r = (content_w < content_h ? content_w : content_h) / 2 - 16;
-        
-        /* Draw Clock Face */
-        gui_draw_circle(cx, cy, r, 0xF0F0F0, true);      /* Face */
-        gui_draw_circle(cx, cy, r, 0x808080, false);     /* Outline */
-        gui_draw_circle(cx, cy, 3, 0x000000, true);      /* Center dot */
-        
-        /* Hour markings */
-        for (int i = 0; i < 12; i++) {
-            int idx = i * 5;
-            int x1 = cx + (r - 10) * clock_sin[idx] / 256;
-            int y1 = cy + (r - 10) * clock_cos[idx] / 256;
-            int x2 = cx + r * clock_sin[idx] / 256;
-            int y2 = cy + r * clock_cos[idx] / 256;
-            gui_draw_line(x1, y1, x2, y2, 0x303030);
-        }
-        
-        /* Get time from PL031 RTC at 0x09010000 (QEMU virt) */
-        /* This provides Unix timestamp (seconds since 1970) */
-        volatile uint32_t *pl031_data = (volatile uint32_t *)0x09010000;
-        uint64_t secs = *pl031_data;
-        
-        /* Apply timezone offset (e.g. -5 for EST) */
-        /* Default to UTC for now, or maybe -5 for user */
-        int tz_offset = -5;
-        secs += tz_offset * 3600;
-        
-        int s = secs % 60;
-        int m = (secs / 60) % 60;
-        int h = (secs / 3600) % 12;
-        if (h == 0) h = 12;
-        
-        /* Hour Hand */
-        int h_idx = (h * 5 + m / 12) % 60;
-        int hx = cx + (r * 60 / 100) * clock_sin[h_idx] / 256;
-        int hy = cy + (r * 60 / 100) * clock_cos[h_idx] / 256;
-        gui_draw_line(cx, cy, hx, hy, 0x202020); /* Simple line for now */
-        /* Draw thicker by drawing parallel lines? Simple line is fine for low-res */
-        
-        /* Minute Hand */
-        int mx = cx + (r * 85 / 100) * clock_sin[m] / 256;
-        int my = cy + (r * 85 / 100) * clock_cos[m] / 256;
-        gui_draw_line(cx, cy, mx, my, 0x404040);
-        
-        /* Second Hand */
-        int sx = cx + (r * 90 / 100) * clock_sin[s] / 256;
-        int sy = cy + (r * 90 / 100) * clock_cos[s] / 256;
-        gui_draw_line(cx, cy, sx, sy, 0xD02020); /* Red */
     }
     
     /* Call window's draw callback if set */
@@ -1581,60 +1014,8 @@ static void draw_menu_bar(void)
     /* Vib-OS name (bold) */
     gui_draw_string(36, 6, "Vib-OS", 0xFFFFFF, 0x303038);
     
-    /* Clock on right - compute from PL031 RTC */
-    {
-        /* Read PL031 RTC at 0x09010000 */
-        volatile uint32_t *pl031_data = (volatile uint32_t *)0x09010000;
-        uint64_t secs = *pl031_data;
-        
-        /* Timezone offset */
-        int tz_offset = -5;
-        secs += tz_offset * 3600;
-        
-        /* Convert to HH:MM */
-        int hrs = (secs / 3600) % 24;
-        int mins = (secs / 60) % 60;
-        
-        char time_str[6];
-        time_str[0] = '0' + (hrs / 10);
-        time_str[1] = '0' + (hrs % 10);
-        time_str[2] = ':';
-        time_str[3] = '0' + (mins / 10);
-        time_str[4] = '0' + (mins % 10);
-        time_str[5] = '\0';
-        
-        gui_draw_string(primary_display.width - 52, 6, time_str, 0xFFFFFF, 0x3E3E55);
-    }
-    
-    /* WiFi Icon (Static Connected) */
-    {
-        int wx = primary_display.width - 86;
-        int wy = 12;
-        /* Draw arcs using simple lines/pixels */
-        /* Center dot */
-        gui_draw_rect(wx, wy + 6, 2, 2, 0xFFFFFF);
-        /* Middle arc */
-        gui_draw_line(wx - 3, wy + 3, wx, wy, 0xFFFFFF);
-        gui_draw_line(wx, wy, wx + 3, wy + 3, 0xFFFFFF);
-        /* Top arc */
-        gui_draw_line(wx - 6, wy, wx, wy - 3, 0xFFFFFF);
-        gui_draw_line(wx, wy - 3, wx + 6, wy, 0xFFFFFF);
-    }
-    
-    /* WiFi Icon (Static Connected) */
-    {
-        int wx = primary_display.width - 86;
-        int wy = 12;
-        /* Draw arcs using simple lines/pixels */
-        /* Center dot */
-        gui_draw_rect(wx, wy + 6, 2, 2, 0xFFFFFF);
-        /* Middle arc */
-        gui_draw_line(wx - 3, wy + 3, wx, wy, 0xFFFFFF);
-        gui_draw_line(wx, wy, wx + 3, wy + 3, 0xFFFFFF);
-        /* Top arc */
-        gui_draw_line(wx - 6, wy, wx, wy - 3, 0xFFFFFF);
-        gui_draw_line(wx, wy - 3, wx + 6, wy, 0xFFFFFF);
-    }
+    /* Clock on right */
+    gui_draw_string(primary_display.width - 52, 6, "12:00", 0xFFFFFF, 0x3E3E55);
     
     /* Draw dropdown if open */
     if (menu_open == 1) {
@@ -1667,9 +1048,9 @@ static void draw_menu_bar(void)
 #include "icons.h"
 
 static const char *dock_labels[] = {
-    "Term", "Files", "Calc", "Notes", "Set", "Clock", "DOOM", "Snake", "Help", "Web"
+    "Term", "Files", "Calc", "Notes", "Set", "Clock", "Game", "Help"
 };
-#define NUM_DOCK_ICONS 10
+#define NUM_DOCK_ICONS 8
 #define DOCK_ICON_SIZE 44   /* Slightly smaller for more icons */
 #define DOCK_ICON_MARGIN 4  /* Padding inside dock pill */
 #define DOCK_PADDING 8      /* Space between icons */
@@ -1723,13 +1104,10 @@ static const uint32_t icon_colors[] = {
     0xEAB308,  /* Notepad - yellow */
     0x6B7280,  /* Settings - gray */
     0x8B5CF6,  /* Clock - purple */
-    0xEF4444,  /* DOOM - red */
-    0x22C55E,  /* Snake - bright green */
+    0xEF4444,  /* Game - red */
     0x06B6D4,  /* Help - cyan */
-    0x0EA5E9,  /* Browser - sky blue */
 };
 
-/* Draw dock with hover animations */
 static void draw_dock(void)
 {
     int dock_content_w = NUM_DOCK_ICONS * (DOCK_ICON_SIZE + DOCK_PADDING) - DOCK_PADDING + 32;
@@ -1737,62 +1115,39 @@ static void draw_dock(void)
     int dock_y = primary_display.height - DOCK_HEIGHT + 6;
     int dock_h = DOCK_HEIGHT - 12;
     
-    /* Frosted glass dock background */
+    /* Frosted glass dock background - lighter and translucent */
     uint32_t glass_base = 0x404050;
     draw_rounded_rect(dock_x, dock_y, dock_content_w, dock_h, 16, glass_base);
     
-    /* Top highlight */
+    /* Top highlight for glass depth */
     for (int i = dock_x + 16; i < dock_x + dock_content_w - 16; i++) {
         draw_pixel(i, dock_y, 0x606070);
         draw_pixel(i, dock_y + 1, 0x505060);
     }
     
-    /* Inner glow */
+    /* Inner glow/border */
     for (int i = dock_x + 16; i < dock_x + dock_content_w - 16; i++) {
         draw_pixel(i, dock_y + dock_h - 1, 0x303040);
         draw_pixel(i, dock_y + dock_h - 2, 0x353545);
     }
     
-    /* Draw icons */
+    /* Draw icons with colored backgrounds */
     int icon_x = dock_x + 16;
-    int center_y = dock_y + dock_h / 2;
-    
-    /* Checking for hover - if we find one, we'll draw it last so the label is on top */
-    int hovered_idx = -1;
+    int icon_y = dock_y + (dock_h - DOCK_ICON_SIZE) / 2;
     
     for (int i = 0; i < NUM_DOCK_ICONS; i++) {
-        /* Standard size/pos */
-        int size = DOCK_ICON_SIZE;
-        
-        /* Check hover */
-        /* Simple check against the horizontal slot */
-        int slot_w = DOCK_ICON_SIZE + DOCK_PADDING;
-        int is_hovered = 0;
-        
-        if (mouse_y >= dock_y && mouse_y < dock_y + dock_h &&
-            mouse_x >= icon_x && mouse_x < icon_x + DOCK_ICON_SIZE) {
-            is_hovered = 1;
-            hovered_idx = i;
-            size = DOCK_ICON_SIZE + 16; /* Scale up */
-        }
-        
-        int draw_size = size;
-        int draw_x = icon_x - (size - DOCK_ICON_SIZE) / 2;
-        int draw_y = center_y - size / 2;
-        
-        /* Background */
-        int icon_bg_x = draw_x - 2;
-        int icon_bg_y = draw_y - 2;
-        int icon_bg_size = size + 4;
+        /* Rounded icon background with color */
+        int icon_bg_x = icon_x - 2;
+        int icon_bg_y = icon_y - 2;
+        int icon_bg_size = DOCK_ICON_SIZE + 4;
         int icon_r = 10;
         
+        /* Draw colored rounded square background */
         uint32_t bg_color = icon_colors[i];
-        
-        /* Draw background shape */
         gui_draw_rect(icon_bg_x + icon_r, icon_bg_y, icon_bg_size - 2*icon_r, icon_bg_size, bg_color);
         gui_draw_rect(icon_bg_x, icon_bg_y + icon_r, icon_bg_size, icon_bg_size - 2*icon_r, bg_color);
         
-        /* Corners */
+        /* Round corners */
         for (int dy = -icon_r; dy <= icon_r; dy++) {
             for (int dx = -icon_r; dx <= icon_r; dx++) {
                 if (dx*dx + dy*dy <= icon_r*icon_r) {
@@ -1804,45 +1159,10 @@ static void draw_dock(void)
             }
         }
         
-        /* Icon bitmap */
-        draw_icon(draw_x, draw_y, size, dock_icons_bmp[i], 0xFFFFFF, bg_color);
+        /* Draw white icon on colored background */
+        draw_icon(icon_x, icon_y, DOCK_ICON_SIZE, dock_icons_bmp[i], 0xFFFFFF, bg_color);
         
         icon_x += DOCK_ICON_SIZE + DOCK_PADDING;
-    }
-    
-    /* Draw label for hovered item on top */
-    if (hovered_idx >= 0) {
-        const char *label = dock_labels[hovered_idx];
-        
-        /* Re-calculate position for this icon */
-        int idx_x = dock_x + 16 + hovered_idx * (DOCK_ICON_SIZE + DOCK_PADDING);
-        int size = DOCK_ICON_SIZE + 16;
-        int draw_x = idx_x - (size - DOCK_ICON_SIZE) / 2;
-        int draw_y = center_y - size / 2;
-        
-        /* Label box above icon */
-        int label_len = 0;
-        while (label[label_len]) label_len++;
-        int label_w = label_len * 8 + 16;
-        int label_h = 24;
-        int label_x = draw_x + (size - label_w) / 2;
-        int label_y = draw_y - 30;
-        
-        /* Draw label background */
-        draw_rounded_rect(label_x, label_y, label_w, label_h, 6, 0x303040);
-        gui_draw_rect_outline(label_x, label_y, label_w, label_h, 0x505060, 1);
-        
-        /* Draw text */
-        gui_draw_string(label_x + 8, label_y + 4, label, 0xFFFFFF, 0x303040);
-        
-        /* Little triangle pointing down */
-        int tri_x = label_x + label_w / 2;
-        int tri_y = label_y + label_h;
-        for (int i = 0; i < 4; i++) {
-            for (int j = -i; j <= i; j++) {
-                draw_pixel(tri_x + j, tri_y + i, 0x303040);
-            }
-        }
     }
 }
 
@@ -1920,66 +1240,78 @@ static void draw_desktop(void)
 /* Compositor - Draw everything */
 /* ===================================================================== */
 
+#define CURSOR_WIDTH 12
+#define CURSOR_HEIGHT 19
+extern const uint8_t cursor_data[CURSOR_HEIGHT][CURSOR_WIDTH];
+
+static uint32_t static_backbuffer[1024 * 768] __attribute__((aligned(4096)));
+
+static void gui_present_frame(void)
+{
+    if (!primary_display.backbuffer || !primary_display.framebuffer) return;
+
+    uint64_t *src = (uint64_t *)primary_display.backbuffer;
+    uint64_t *dst = (uint64_t *)primary_display.framebuffer;
+    size_t count64 = (primary_display.pitch * primary_display.height) / 8;
+    size_t i = 0;
+
+    size_t fast_count = count64 & ~7UL;
+    for (; i < fast_count; i += 8) {
+        dst[i]   = src[i];
+        dst[i+1] = src[i+1];
+        dst[i+2] = src[i+2];
+        dst[i+3] = src[i+3];
+        dst[i+4] = src[i+4];
+        dst[i+5] = src[i+5];
+        dst[i+6] = src[i+6];
+        dst[i+7] = src[i+7];
+    }
+    for (; i < count64; i++) {
+        dst[i] = src[i];
+    }
+
+    asm volatile("dsb sy" ::: "memory");
+    asm volatile("dmb sy" ::: "memory");
+
+    primary_display.frame_counter++;
+}
+
 void gui_compose(void)
 {
-    /* Draw desktop and taskbar */
     draw_desktop();
-    
-    /* Update Snake game state (throttled) */
-    static int snake_tick = 0;
-    if (++snake_tick >= 10) { /* Update every 10 frames */
-        snake_tick = 0;
-        snake_move();
-    }
-    
-    /* Draw windows from bottom to top (reverse order) */
-    /* First, find tail of list */
+
     struct window *tail = NULL;
     for (struct window *win = window_stack; win; win = win->next) {
         tail = win;
     }
     (void)tail;
-    
-    /* Draw from tail to head */
-    /* For simplicity, just iterate normally (top window drawn last) */
+
     struct window *draw_order[MAX_WINDOWS];
     int count = 0;
     for (struct window *win = window_stack; win && count < MAX_WINDOWS; win = win->next) {
         draw_order[count++] = win;
     }
-    
-    /* Draw in reverse (bottom to top) */
+
     for (int i = count - 1; i >= 0; i--) {
         draw_window(draw_order[i]);
     }
-    
-    /* Ultra-fast copy backbuffer to framebuffer using unrolled 64-bit transfers */
-    if (primary_display.backbuffer && primary_display.framebuffer) {
-        uint64_t *src = (uint64_t *)primary_display.backbuffer;
-        uint64_t *dst = (uint64_t *)primary_display.framebuffer;
-        size_t count64 = (primary_display.pitch * primary_display.height) / 8;
-        size_t i = 0;
-        
-        /* Unrolled copy - 8 qwords (64 bytes / 16 pixels) per iteration */
-        size_t fast_count = count64 & ~7UL;  /* Round down to multiple of 8 */
-        for (; i < fast_count; i += 8) {
-            dst[i]   = src[i];
-            dst[i+1] = src[i+1];
-            dst[i+2] = src[i+2];
-            dst[i+3] = src[i+3];
-            dst[i+4] = src[i+4];
-            dst[i+5] = src[i+5];
-            dst[i+6] = src[i+6];
-            dst[i+7] = src[i+7];
+
+    for (int row = 0; row < CURSOR_HEIGHT; row++) {
+        for (int col = 0; col < CURSOR_WIDTH; col++) {
+            uint8_t pixel = cursor_data[row][col];
+            if (pixel == 0) continue;
+            int px = mouse_x + col;
+            int py = mouse_y + row;
+            if (px >= 0 && px < (int)primary_display.width &&
+                py >= 0 && py < (int)primary_display.height) {
+                uint32_t color = (pixel == 1) ? 0xFF000000 : 0xFFFFFFFF;
+                uint32_t *backbuffer = primary_display.backbuffer;
+                backbuffer[py * (primary_display.pitch / 4) + px] = color;
+            }
         }
-        /* Handle remaining */
-        for (; i < count64; i++) {
-            dst[i] = src[i];
-        }
-        
-        /* Memory barrier to ensure writes are visible before next frame */
-        asm volatile("dsb sy" ::: "memory");
     }
+
+    gui_present_frame();
 }
 
 /* ===================================================================== */
@@ -1990,7 +1322,7 @@ void gui_compose(void)
 #define CURSOR_HEIGHT 19
 
 /* Classic Mac arrow: 1=black, 2=white, 0=transparent */
-static const uint8_t cursor_data[CURSOR_HEIGHT][CURSOR_WIDTH] = {
+const uint8_t cursor_data[CURSOR_HEIGHT][CURSOR_WIDTH] = {
     {1,0,0,0,0,0,0,0,0,0,0,0},
     {1,1,0,0,0,0,0,0,0,0,0,0},
     {1,2,1,0,0,0,0,0,0,0,0,0},
@@ -2012,22 +1344,25 @@ static const uint8_t cursor_data[CURSOR_HEIGHT][CURSOR_WIDTH] = {
     {0,0,0,0,0,0,0,1,1,0,0,0},
 };
 
+/* Mouse position - non-static so gui_compose can access */
+static int mouse_buttons = 0;
 static uint32_t saved_bg[CURSOR_HEIGHT][CURSOR_WIDTH];
 static int saved_x = -1, saved_y = -1;
 static int cursor_visible = 0;
 
 static void save_cursor_background(int x, int y)
 {
+    /* Read from BACKBUFFER for consistency */
+    uint32_t *backbuffer = primary_display.backbuffer;
+    if (!backbuffer) return;
+
     for (int row = 0; row < CURSOR_HEIGHT; row++) {
         for (int col = 0; col < CURSOR_WIDTH; col++) {
             int px = x + col;
             int py = y + row;
-            if (px >= 0 && px < (int)primary_display.width && 
+            if (px >= 0 && px < (int)primary_display.width &&
                 py >= 0 && py < (int)primary_display.height) {
-                uint32_t *target = primary_display.framebuffer;
-                if (target) {
-                    saved_bg[row][col] = target[py * (primary_display.pitch / 4) + px];
-                }
+                saved_bg[row][col] = backbuffer[py * (primary_display.pitch / 4) + px];
             }
         }
     }
@@ -2038,17 +1373,18 @@ static void save_cursor_background(int x, int y)
 static void restore_cursor_background(void)
 {
     if (saved_x < 0) return;
-    
+
+    /* Draw to BACKBUFFER for flicker-free rendering */
+    uint32_t *backbuffer = primary_display.backbuffer;
+    if (!backbuffer) return;
+
     for (int row = 0; row < CURSOR_HEIGHT; row++) {
         for (int col = 0; col < CURSOR_WIDTH; col++) {
             int px = saved_x + col;
             int py = saved_y + row;
-            if (px >= 0 && px < (int)primary_display.width && 
+            if (px >= 0 && px < (int)primary_display.width &&
                 py >= 0 && py < (int)primary_display.height) {
-                uint32_t *target = primary_display.framebuffer;
-                if (target) {
-                    target[py * (primary_display.pitch / 4) + px] = saved_bg[row][col];
-                }
+                backbuffer[py * (primary_display.pitch / 4) + px] = saved_bg[row][col];
             }
         }
     }
@@ -2057,20 +1393,21 @@ static void restore_cursor_background(void)
 
 static void draw_cursor_at(int x, int y)
 {
+    /* Draw to BACKBUFFER for flicker-free rendering */
+    uint32_t *backbuffer = primary_display.backbuffer;
+    if (!backbuffer) return;
+
     for (int row = 0; row < CURSOR_HEIGHT; row++) {
         for (int col = 0; col < CURSOR_WIDTH; col++) {
             uint8_t pixel = cursor_data[row][col];
             if (pixel == 0) continue;
-            
+
             int px = x + col;
             int py = y + row;
-            if (px >= 0 && px < (int)primary_display.width && 
+            if (px >= 0 && px < (int)primary_display.width &&
                 py >= 0 && py < (int)primary_display.height) {
                 uint32_t color = (pixel == 1) ? 0x00000000 : 0x00FFFFFF;
-                uint32_t *target = primary_display.framebuffer;
-                if (target) {
-                    target[py * (primary_display.pitch / 4) + px] = color;
-                }
+                backbuffer[py * (primary_display.pitch / 4) + px] = color;
             }
         }
     }
@@ -2078,28 +1415,13 @@ static void draw_cursor_at(int x, int y)
 
 void gui_draw_cursor(void)
 {
-    extern void mouse_get_position(int *x, int *y);
-    int new_x, new_y;
-    mouse_get_position(&new_x, &new_y);
-    
-    /* Only update if position changed */
-    if (new_x == mouse_x && new_y == mouse_y && cursor_visible) {
-        return;
-    }
-    
-    /* Restore old background */
-    if (cursor_visible) {
-        restore_cursor_background();
-    }
-    
-    /* Update position */
-    mouse_x = new_x;
-    mouse_y = new_y;
-    
-    /* Save and draw new cursor */
-    save_cursor_background(mouse_x, mouse_y);
     draw_cursor_at(mouse_x, mouse_y);
-    cursor_visible = 1;
+}
+
+void gui_update_mouse_position(int x, int y)
+{
+    mouse_x = x;
+    mouse_y = y;
 }
 
 void gui_move_mouse(int dx, int dy)
@@ -2134,16 +1456,10 @@ void gui_handle_key_event(int key)
             focused_window->title[2] == 't') {
             notepad_key(key);
         }
-        /* Check if it's a Rename window */
-        else if (focused_window->title[0] == 'R' && 
-            focused_window->title[1] == 'e' && 
-            focused_window->title[2] == 'n') {
-            rename_key(key);
-        }
         /* Check if it's a Game window */
-        else if (focused_window->title[0] == 'S' && 
-            focused_window->title[1] == 'n' && 
-            focused_window->title[2] == 'a') {
+        else if (focused_window->title[0] == 'G' && 
+            focused_window->title[1] == 'a' && 
+            focused_window->title[2] == 'm') {
             snake_key(key);
         }
         /* Call window's key handler if set */
@@ -2164,11 +1480,9 @@ static int prev_buttons = 0;
 
 void gui_handle_mouse_event(int x, int y, int buttons)
 {
-    int prev_x = mouse_x;
-    int prev_y = mouse_y;
     mouse_x = x;
     mouse_y = y;
-    
+
     int left_click = (buttons & 1) && !(prev_buttons & 1);  /* Just pressed */
     int left_held = (buttons & 1);
     int left_release = !(buttons & 1) && (prev_buttons & 1);
@@ -2194,6 +1508,33 @@ void gui_handle_mouse_event(int x, int y, int buttons)
     }
     
     prev_buttons = buttons;
+    
+    /* Process hover over windows (even without clicks) */
+    for (struct window *win = window_stack; win; win = win->next) {
+        if (!win->visible) continue;
+        
+        /* Check if mouse is over this window */
+        int mouse_in_win = (x >= win->x && x < win->x + win->width &&
+                            y >= win->y && y < win->y + win->height);
+        
+        if (mouse_in_win) {
+            /* Move window to top of stack */
+            if (win != window_stack) {
+                /* Remove from current position */
+                for (struct window **curr = &window_stack; *curr; curr = &(*curr)->next) {
+                    if (*curr == win) {
+                        *curr = win->next;
+                        break;
+                    }
+                }
+                /* Add to front */
+                win->next = window_stack;
+                window_stack = win;
+                focused_window = win;
+            }
+            break;
+        }
+    }
     
     /* Check if clicking on a window */
     if (!left_click) return;
@@ -2368,15 +1709,13 @@ void gui_handle_mouse_event(int x, int y, int buttons)
                         gui_create_window("Terminal", spawn_x, spawn_y, 450, 320);
                         break;
                     case 1: /* Files */
-                        gui_create_file_manager(spawn_x + 30, spawn_y + 20);
+                        gui_create_window("Files", spawn_x + 30, spawn_y + 20, 400, 350);
                         break;
                     case 2: /* Calculator */
                         gui_create_window("Calculator", spawn_x + 60, spawn_y + 40, 200, 280);
                         break;
                     case 3: /* Notepad */
-                        /* Call open with NULL to just open blank */
-                        extern void gui_open_notepad(const char *path);
-                        gui_open_notepad(NULL);
+                        gui_create_window("Notepad", spawn_x + 90, spawn_y + 60, 450, 350);
                         break;
                     case 4: /* Settings */
                         gui_create_window("Settings", spawn_x + 20, spawn_y + 30, 380, 320);
@@ -2384,53 +1723,11 @@ void gui_handle_mouse_event(int x, int y, int buttons)
                     case 5: /* Clock */
                         gui_create_window("Clock", spawn_x + 50, spawn_y + 40, 260, 200);
                         break;
-                    case 6: /* DOOM - Direct call test */
-                        {
-                            printk("GUI: Direct DOOM call test...\n");
-                            extern void *vfs_lookup(const char *path);
-                            extern int vfs_read_compat(void *node, void *buf, unsigned int size, unsigned int offset);
-                            extern int elf_load_at(void *data, unsigned int size, uint64_t load_addr, void *info);
-                            
-                            
-                            extern void *kapi_get(void);
-                            
-                            void *file = vfs_lookup("/bin/doom");
-                            if (!file) { printk("DOOM not found\n"); break; }
-                            
-                            char *data = kmalloc(900000);
-                            int bytes = vfs_read_compat(file, data, 900000, 0);
-                            printk("Read %d bytes\n", bytes);
-                            
-                            typedef struct { uint64_t entry; uint64_t load_base; uint64_t load_size; } elf_info_t;
-                            elf_info_t info = {0};
-                            if (elf_load_at(data, bytes, 0x44000000, &info) != 0) {
-                                printk("ELF load failed\n");
-                                kfree(data);
-                                break;
-                            }
-                            kfree(data);
-                            printk("Entry at 0x%llx\n", info.entry);
-                            
-                            typedef int (*entry_t)(void*, int, char**);
-                            entry_t doom_main = (entry_t)info.entry;
-                            void *api = kapi_get();
-                            char *argv[] = { "/bin/doom", 0 };
-                            printk("Calling DOOM directly at 0x%llx...\n", (uint64_t)doom_main);
-                            int ret = doom_main(api, 1, argv);
-                            printk("DOOM returned %d\n", ret);
-                        }
+                    case 6: /* Game */
+                        gui_create_window("Game", spawn_x + 70, spawn_y + 50, 400, 320);
                         break;
-                    case 7: /* Snake */
-                        {
-                            snake_init();
-                            gui_create_window("Snake", spawn_x + 70, spawn_y + 50, 340, 280);
-                        }
-                        break;
-                    case 8: /* Help */
+                    case 7: /* Help */
                         gui_create_window("Help", spawn_x + 120, spawn_y + 80, 350, 280);
-                        break;
-                    case 9: /* Browser */
-                        gui_create_window("Browser", spawn_x + 150, spawn_y + 90, 600, 450);
                         break;
                 }
                 spawn_x = (spawn_x + 40) % 250 + 80;
@@ -2449,28 +1746,39 @@ void gui_handle_mouse_event(int x, int y, int buttons)
 int gui_init(uint32_t *framebuffer, uint32_t width, uint32_t height, uint32_t pitch)
 {
     printk(KERN_INFO "GUI: Initializing windowing system\n");
-    
-    /* Register input callbacks */
-    extern void input_set_gui_key_callback(void (*callback)(int key));
-    extern void gui_handle_key_event(int key);
-    input_set_gui_key_callback(gui_handle_key_event);
-    
+
     primary_display.framebuffer = framebuffer;
     primary_display.width = width;
     primary_display.height = height;
     primary_display.pitch = pitch;
     primary_display.bpp = 32;
-    
-    /* Allocate backbuffer for double-buffering */
+    primary_display.frame_counter = 0;
+    primary_display.last_present_counter = 0;
+    primary_display.vsync_enabled = false;
+
     primary_display.backbuffer = kmalloc(pitch * height);
-    
-    /* Clear windows */
+    if (!primary_display.backbuffer) {
+        printk(KERN_WARNING "GUI: kmalloc failed, using static backbuffer\n");
+        primary_display.backbuffer = static_backbuffer;
+    }
+
+    if (framebuffer && primary_display.backbuffer) {
+        uint64_t *src = (uint64_t *)framebuffer;
+        uint64_t *dst = (uint64_t *)primary_display.backbuffer;
+        size_t count64 = (pitch * height) / 8;
+        for (size_t i = 0; i < count64; i++) {
+            dst[i] = src[i];
+        }
+        asm volatile("dsb sy" ::: "memory");
+    }
+
     for (int i = 0; i < MAX_WINDOWS; i++) {
         windows[i].id = 0;
     }
-    
-    printk(KERN_INFO "GUI: Display %ux%u initialized\n", width, height);
-    
+
+    printk(KERN_INFO "GUI: Display %ux%u initialized (backbuffer at 0x%lx)\n",
+           width, height, (unsigned long)primary_display.backbuffer);
+
     return 0;
 }
 
@@ -2478,160 +1786,3 @@ struct display *gui_get_display(void)
 {
     return &primary_display;
 }
-
-struct window *gui_create_file_manager(int x, int y)
-{
-    struct window *win = gui_create_window("File Manager", x, y, 450, 350);
-    if (win) {
-        struct fm_state *st = kmalloc(sizeof(struct fm_state));
-        if (st) {
-            st->path[0] = '/'; st->path[1] = '\0';
-            st->selected[0] = '\0';
-            st->scroll_y = 0;
-            win->userdata = st;
-            win->on_mouse = fm_on_mouse;
-        }
-    }
-    return win;
-}
-
-static void notepad_on_mouse(struct window *win, int x, int y, int buttons)
-{
-    /* Check Save Button */
-    /* Toolbar area */
-    int content_y = BORDER_WIDTH + TITLEBAR_HEIGHT;
-    if (y >= content_y && y < content_y + 30) {
-        if (x >= BORDER_WIDTH + 10 && x < BORDER_WIDTH + 70) {
-            /* Save clicked */
-            if (notepad_filepath[0]) {
-                /* Open for writing */
-                struct file *f = vfs_open(notepad_filepath, O_RDWR | O_CREAT, 0644);
-                if (f) {
-                    /* Determine length */
-                    int len = 0; while(notepad_text[len] && len < NOTEPAD_MAX_TEXT) len++;
-                    
-                    /* Write content */
-                    extern ssize_t vfs_write(struct file *file, const char *buf, size_t count);
-                    vfs_write(f, notepad_text, len);
-                    /* Reset file position if we want to ensure we wrote from start? vfs_open sets pos 0. */
-                    
-                    /* Hack: Force truncation in ramfs? For now just overwrite. */
-                    
-                    vfs_close(f);
-                    
-                    printk("Notepad: Saved %d bytes to %s\n", len, notepad_filepath);
-                }
-            }
-        }
-    }
-}
-
-void gui_open_notepad(const char *path)
-{
-    /* Clear existing state */
-    notepad_text[0] = '\0';
-    notepad_cursor = 0;
-    notepad_filepath[0] = '\0';
-    
-    if (path) {
-        /* Copy path */
-        int i=0; while(path[i] && i<255) { notepad_filepath[i] = path[i]; i++; }
-        notepad_filepath[i] = '\0';
-        
-        /* Read file */
-        struct file *f = vfs_open(path, O_RDONLY, 0);
-        if (f) {
-            /* Read up to max */
-            extern ssize_t vfs_read(struct file *file, char *buf, size_t count);
-            int bytes = vfs_read(f, notepad_text, NOTEPAD_MAX_TEXT-1);
-            if (bytes >= 0) {
-                notepad_text[bytes] = '\0';
-                if (bytes < NOTEPAD_MAX_TEXT) notepad_text[bytes] = '\0';
-                notepad_cursor = bytes;
-            }
-            vfs_close(f);
-        }
-    }
-    
-    struct window *win = gui_create_window("Notepad", 150, 80, 450, 350);
-    if (win) {
-        win->on_mouse = notepad_on_mouse;
-    }
-}
-
-static void rename_on_mouse(struct window *win, int x, int y, int buttons)
-{
-    /* Check Save Button */
-    int content_y = BORDER_WIDTH + TITLEBAR_HEIGHT;
-    if (y >= content_y && y < content_y + 30) {
-        if (x >= BORDER_WIDTH + 10 && x < BORDER_WIDTH + 70) {
-            /* Save (Rename) clicked */
-            if (rename_path[0] && rename_text[0]) {
-                /* Construct new full path */
-                char new_full_path[512];
-                
-                /* Extract parent dir from rename_path */
-                int i = 0;
-                int last_slash = -1;
-                while(rename_path[i]) {
-                    new_full_path[i] = rename_path[i];
-                    if (rename_path[i] == '/') last_slash = i;
-                    i++;
-                }
-                
-                /* Append new name after last slash */
-                int idx = last_slash + 1;
-                int t_idx = 0;
-                while(rename_text[t_idx]) {
-                    new_full_path[idx++] = rename_text[t_idx++];
-                }
-                new_full_path[idx] = '\0';
-                
-                /* Call vfs_rename */
-                extern int vfs_rename(const char *old, const char *new);
-                int ret = vfs_rename(rename_path, new_full_path);
-                
-                if (ret == 0) {
-                    printk("Rename successful: %s -> %s\n", rename_path, new_full_path);
-                    win->visible = 0; /* Close window */
-                } else {
-                    printk("Rename failed: %d\n", ret);
-                }
-            }
-        }
-    }
-}
-
-void gui_open_rename(const char *path)
-{
-    /* Clear state */
-    rename_text[0] = '\0';
-    rename_cursor = 0;
-    
-    /* Copy path */
-    int i=0; while(path[i] && i<511) { rename_path[i] = path[i]; i++; }
-    rename_path[i] = '\0';
-    
-    /* Pre-fill text with filename only */
-    int last_slash = -1;
-    i = 0;
-    while(rename_path[i]) {
-        if (rename_path[i] == '/') last_slash = i;
-        i++;
-    }
-    
-    const char *filename = rename_path + last_slash + 1;
-    i = 0;
-    while(filename[i] && i < 255) {
-        rename_text[i] = filename[i];
-        i++;
-    }
-    rename_text[i] = '\0';
-    rename_cursor = i;
-    
-    struct window *win = gui_create_window("Rename", 200, 150, 300, 150);
-    if (win) {
-        win->on_mouse = rename_on_mouse;
-    }
-}
-

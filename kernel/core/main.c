@@ -152,11 +152,6 @@ static void init_subsystems(void *dtb)
     printk(KERN_INFO "  Initializing scheduler...\n");
     sched_init();
     
-    /* Initialize process subsystem */
-    printk(KERN_INFO "  Initializing process subsystem...\n");
-    extern void process_init(void);
-    process_init();
-    
     /* ================================================================= */
     /* Phase 4: Filesystems */
     /* ================================================================= */
@@ -165,33 +160,13 @@ static void init_subsystems(void *dtb)
     
     /* Initialize Virtual Filesystem */
     printk(KERN_INFO "  Initializing VFS...\n");
-    /* Initialize Virtual Filesystem */
-    printk(KERN_INFO "  Initializing VFS...\n");
     vfs_init();
-    
-    /* Initialize and Register RamFS */
-    printk(KERN_INFO "  Initializing RamFS...\n");
-    extern int ramfs_init(void);
-    ramfs_init();
     
     /* Mount root filesystem */
     printk(KERN_INFO "  Mounting root filesystem...\n");
-    if (vfs_mount("ramfs", "/", "ramfs", 0, NULL) != 0) {
-        panic("Failed to mount root filesystem!");
-    }
+    /* TODO: mount_root(); */
     
-    /* Populate filesystem with sample data */
-    extern int ramfs_create_dir(const char *path, mode_t mode);
-    extern int ramfs_create_file(const char *path, mode_t mode, const char *content);
-    
-    ramfs_create_dir("Documents", 0755);
-    ramfs_create_dir("Downloads", 0755);
-    ramfs_create_dir("Pictures", 0755);
-    ramfs_create_dir("System", 0755);
-    ramfs_create_file("readme.txt", 0644, "Welcome to Vib-OS!\nThis is a real file in RamFS.");
-    ramfs_create_file("todo.txt", 0644, "- Implement Browser\n- Fix Bugs\n- Sleep");
-    
-    /* Mount proc, sys, dev (placeholders) */
+    /* Mount proc, sys, dev */
     printk(KERN_INFO "  Mounting procfs...\n");
     printk(KERN_INFO "  Mounting sysfs...\n");
     printk(KERN_INFO "  Mounting devfs...\n");
@@ -218,35 +193,30 @@ static void init_subsystems(void *dtb)
     uint32_t *fb_buffer;
     uint32_t fb_width, fb_height;
     fb_get_info(&fb_buffer, &fb_width, &fb_height);
-    
+
     if (fb_buffer) {
-        gui_init(fb_buffer, fb_width, fb_height, fb_width * 4);
-        
-        /* Create demo windows */
-    extern struct window *gui_create_file_manager(int x, int y);
-    gui_create_window("Terminal", 50, 50, 400, 300);
-    gui_create_file_manager(200, 100);
-        
-        /* Compose and display desktop */
-        gui_compose();
-        gui_draw_cursor();
-        
-        printk(KERN_INFO "  GUI desktop ready!\\n");
+        printk(KERN_INFO "  Framebuffer at 0x%lx, size %ux%u\n",
+               (unsigned long)fb_buffer, fb_width, fb_height);
+
+        int ret = gui_init(fb_buffer, fb_width, fb_height, fb_width * 4);
+        if (ret < 0) {
+            printk(KERN_ERR "  GUI init failed!\n");
+        } else {
+            /* Create demo windows */
+            gui_create_window("Terminal", 50, 50, 400, 300);
+            gui_create_window("File Manager", 200, 100, 450, 350);
+
+            /* Compose and display desktop */
+            gui_compose();
+
+            printk(KERN_INFO "  GUI desktop ready!\n");
+        }
     }
-    
-    /* Initialize PCI bus and detect devices (including Audio) */
-    printk(KERN_INFO "  Initializing PCI bus...\n");
-    extern void pci_init(void);
-    pci_init();
     
     printk(KERN_INFO "  Loading keyboard driver...\n");
     printk(KERN_INFO "  Loading NVMe driver...\n");
     printk(KERN_INFO "  Loading USB driver...\n");
     printk(KERN_INFO "  Loading network driver...\n");
-    extern void tcpip_init(void);
-    extern int virtio_net_init(void);
-    tcpip_init();
-    virtio_net_init();
     
     /* ================================================================= */
     /* Phase 6: Enable Interrupts */
@@ -267,15 +237,10 @@ static void init_subsystems(void *dtb)
 static void *g_active_terminal = 0;
 
 /* Keyboard callback wrapper */
-/* Keyboard callback wrapper */
 static void keyboard_handler(int key)
 {
     extern void gui_handle_key_event(int key);
     gui_handle_key_event(key);
-    
-    /* Also send to KAPI input buffer for non-windowed apps (e.g. Doom) */
-    extern void kapi_sys_key_event(int key);
-    kapi_sys_key_event(key);
 }
 
 static void start_init_process(void)
@@ -299,27 +264,25 @@ static void start_init_process(void)
     input_set_key_callback(keyboard_handler);
     
     printk(KERN_INFO "GUI: Event loop started - type in terminal!\\n");
-    
+
     /* Initial render */
     gui_compose();
-    gui_draw_cursor();
-    
-    /* Main GUI event loop with proper flicker-free refresh */
+
+    /* Main GUI event loop with flicker-free rendering */
     uint32_t frame = 0;
     int last_mx = 0, last_my = 0;
     int last_buttons = 0;
     int needs_redraw = 1;  /* Initial draw */
-    int cursor_only = 0;   /* Only cursor needs updating */
-    
-    /* Timer for periodic auto-refresh (200ms = 5 FPS, flicker-free) */
+
+    /* Timer for periodic refresh (50ms = 20 FPS) */
     extern uint64_t timer_get_ms(void);
     uint64_t last_refresh = timer_get_ms();
-    const uint64_t REFRESH_MS = 200;  /* 5 FPS - smooth, no flicker */
-    
+    const uint64_t REFRESH_MS = 50;  /* 20 FPS */
+
     while (1) {
         /* Poll virtio input devices (keyboard/mouse) - MUST call this! */
         input_poll();
-        
+
         /* Poll for keyboard input from UART as well */
         extern int uart_getc_nonblock(void);
         extern void gui_handle_key_event(int key);
@@ -329,57 +292,49 @@ static void start_init_process(void)
             gui_handle_key_event(c);
             needs_redraw = 1;
         }
-        
-        /* Poll input system (Keyboard & Mouse) */
-        extern void input_poll(void);
-        input_poll();
-        
-        /* Get mouse state (updated by input_poll) */
+
+        /* Poll mouse for position and buttons */
         extern void mouse_get_position(int *x, int *y);
         extern int mouse_get_buttons(void);
         extern void gui_handle_mouse_event(int x, int y, int buttons);
-        
+        extern void gui_update_mouse_position(int x, int y);
+
         int mx, my;
         mouse_get_position(&mx, &my);
         int mbuttons = mouse_get_buttons();
-        
+
+        /* Update GUI mouse position */
+        gui_update_mouse_position(mx, my);
+
         /* Check if mouse changed */
         if (mx != last_mx || my != last_my || mbuttons != last_buttons) {
-            /* Only full redraw on button state change (click/release) or drag */
-            if (mbuttons != last_buttons || (mbuttons && (mx != last_mx || my != last_my))) {
-                gui_handle_mouse_event(mx, my, mbuttons);
-                needs_redraw = 1;
-            } else {
-                /* Just cursor moved - update cursor only */
-                cursor_only = 1;
-            }
+            /* Track mouse position and request redraw for cursor */
             last_mx = mx;
             last_my = my;
             last_buttons = mbuttons;
+            
+            /* Process mouse events for clicks and interactions */
+            gui_handle_mouse_event(mx, my, mbuttons);
+            needs_redraw = 1;
         }
-        
-        /* Periodic refresh for animations (5 FPS) */
+
+        /* Periodic refresh */
         uint64_t now = timer_get_ms();
         if (now - last_refresh >= REFRESH_MS) {
             last_refresh = now;
             needs_redraw = 1;
         }
-        
-        /* Redraw when needed - compose then swap */
+
+        /* Only redraw periodically */
         if (needs_redraw) {
             gui_compose();
-            gui_draw_cursor();
             needs_redraw = 0;
-            cursor_only = 0;
-        } else if (cursor_only) {
-            gui_draw_cursor();
-            cursor_only = 0;
         }
-        
+
         frame++;
         (void)frame;
-        
-        /* Yield to prevent 100% CPU, allows input polling */
+
+        /* Small delay to prevent 100% CPU */
         for (volatile int i = 0; i < 5000; i++) { }
     }
 }

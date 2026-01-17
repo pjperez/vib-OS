@@ -216,16 +216,16 @@ void mouse_poll(void) {
     if (!mouse_base || !used) {
         return;
     }
-    
+
     mmio_barrier();
     uint16_t current_used = used->idx;
-    
+
     while (last_used_idx != current_used) {
         uint16_t idx = last_used_idx % QUEUE_SIZE;
         uint32_t desc_idx = used->ring[idx].id;
-        
+
         virtio_input_event_t *ev = &events[desc_idx];
-        
+
         /* Process event */
         if (ev->type == EV_ABS) {
             if (ev->code == ABS_X) {
@@ -243,15 +243,15 @@ void mouse_poll(void) {
                 else mouse_buttons &= ~2;
             }
         }
-        
+
         /* Re-add descriptor to available ring */
         uint16_t avail_idx = avail->idx % QUEUE_SIZE;
         avail->ring[avail_idx] = desc_idx;
         avail->idx++;
-        
+
         last_used_idx++;
     }
-    
+
     /* Notify device */
     mmio_write32(mouse_base + VIRTIO_MMIO_QUEUE_NOTIFY/4, 0);
     mmio_write32(mouse_base + VIRTIO_MMIO_INTERRUPT_ACK/4,
@@ -264,7 +264,7 @@ void mouse_poll(void) {
 
 void mouse_get_position(int *x, int *y) {
     mouse_poll();
-    
+
     /* Scale from 0-32767 to screen dimensions */
     if (x) *x = (mouse_x * SCREEN_WIDTH) / 32768;
     if (y) *y = (mouse_y * SCREEN_HEIGHT) / 32768;
@@ -433,37 +433,10 @@ static void keyboard_poll(void) {
         
         /* Process keyboard event */
         if (ev->type == EV_KEY && ev->value == 1) {  /* Key press only */
-            int processed = 0;
-            int vibe_key = 0;
-            
-            /* Manual mapping for Special Keys */
-            if (ev->code == 103) vibe_key = 0x100;      /* KEY_UP */
-            else if (ev->code == 108) vibe_key = 0x101; /* KEY_DOWN */
-            else if (ev->code == 105) vibe_key = 0x102; /* KEY_LEFT */
-            else if (ev->code == 106) vibe_key = 0x103; /* KEY_RIGHT */
-            else if (ev->code == 29) vibe_key = 0x109;  /* CTRL (Left) */
-            else if (ev->code == 97) vibe_key = 0x109;  /* CTRL (Right) */
-            else if (ev->code == 42) vibe_key = 0x10A;  /* SHIFT (Left) */
-            else if (ev->code == 54) vibe_key = 0x10A;  /* SHIFT (Right) */
-            else if (ev->code == 28) vibe_key = '\n';   /* Enter */
-            else if (ev->code == 57) vibe_key = ' ';    /* Space */
-            else if (ev->code == 1) vibe_key = 27;      /* Esc */
-            
-            if (vibe_key) {
-                if (key_callback) key_callback(vibe_key);
-                if (gui_key_callback) gui_key_callback(vibe_key);
-                processed = 1;
-            }
-
-            if (!processed && ev->code < 128) {
+            if (ev->code < 128) {
                 char ascii = scancode_to_ascii[ev->code];
-                /* Send to KAPI callback (direct handling) */
-                if (key_callback && ascii) {
+                if (ascii && key_callback) {
                     key_callback(ascii);
-                }
-                /* Send to GUI callback (if registered) */
-                if (gui_key_callback && ev->code < 128) {
-                    gui_key_callback(ev->code);
                 }
             }
         }
@@ -578,10 +551,6 @@ int input_init(void) {
 
 void input_set_key_callback(void (*callback)(int key)) {
     key_callback = callback;
-}
-
-void input_set_gui_key_callback(void (*callback)(int key)) {
-    gui_key_callback = callback;
 }
 
 void input_poll(void) {

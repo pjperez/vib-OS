@@ -66,11 +66,22 @@
 
 static struct {
     uint32_t *buffer;
+    uint32_t *backbuffer;
     uint32_t width;
     uint32_t height;
     uint32_t pitch;
     bool initialized;
+    bool has_backbuffer;
 } framebuffer = {0};
+
+/* Forward declarations */
+void fb_clear(uint32_t color);
+void fb_put_pixel(int x, int y, uint32_t color);
+void fb_fill_rect(int x, int y, int w, int h, uint32_t color);
+void fb_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg);
+void fb_draw_string(int x, int y, const char *str, uint32_t fg, uint32_t bg);
+void fb_present(void);
+void fb_show_splash(void);
 
 /* ===================================================================== */
 /* Framebuffer Operations */
@@ -79,11 +90,13 @@ static struct {
 void fb_clear(uint32_t color)
 {
     if (!framebuffer.initialized) return;
-    
-    for (uint32_t y = 0; y < framebuffer.height; y++) {
-        for (uint32_t x = 0; x < framebuffer.width; x++) {
-            framebuffer.buffer[y * framebuffer.width + x] = color;
-        }
+
+    uint32_t *target = framebuffer.backbuffer ? framebuffer.backbuffer : framebuffer.buffer;
+    if (!target) return;
+
+    uint32_t pixels = framebuffer.width * framebuffer.height;
+    for (uint32_t i = 0; i < pixels; i++) {
+        target[i] = color;
     }
 }
 
@@ -92,8 +105,11 @@ void fb_put_pixel(int x, int y, uint32_t color)
     if (!framebuffer.initialized) return;
     if (x < 0 || x >= (int)framebuffer.width) return;
     if (y < 0 || y >= (int)framebuffer.height) return;
-    
-    framebuffer.buffer[y * framebuffer.width + x] = color;
+
+    uint32_t *target = framebuffer.backbuffer ? framebuffer.backbuffer : framebuffer.buffer;
+    if (!target) return;
+
+    target[y * framebuffer.width + x] = color;
 }
 
 void fb_fill_rect(int x, int y, int w, int h, uint32_t color)
@@ -128,7 +144,7 @@ static const uint8_t font_8x8[128][8] = {
 void fb_draw_char(int x, int y, char c, uint32_t fg, uint32_t bg)
 {
     if (c < 0 || c > 127) c = ' ';
-    
+
     for (int row = 0; row < 8; row++) {
         uint8_t line = font_8x8[(int)c][row];
         for (int col = 0; col < 8; col++) {
@@ -146,6 +162,22 @@ void fb_draw_string(int x, int y, const char *str, uint32_t fg, uint32_t bg)
     }
 }
 
+void fb_present(void)
+{
+    if (!framebuffer.initialized || !framebuffer.backbuffer || !framebuffer.buffer) return;
+
+    uint64_t *src = (uint64_t *)framebuffer.backbuffer;
+    uint64_t *dst = (uint64_t *)framebuffer.buffer;
+    size_t count64 = (framebuffer.pitch * framebuffer.height) / 8;
+
+    for (size_t i = 0; i < count64; i++) {
+        dst[i] = src[i];
+    }
+
+    asm volatile("dsb sy" ::: "memory");
+    asm volatile("dmb sy" ::: "memory");
+}
+
 /* ===================================================================== */
 /* Boot Splash Screen */
 /* ===================================================================== */
@@ -153,18 +185,18 @@ void fb_draw_string(int x, int y, const char *str, uint32_t fg, uint32_t bg)
 void fb_show_splash(void)
 {
     if (!framebuffer.initialized) return;
-    
+
     /* Dark blue background */
     fb_clear(0x1E1E2E);
-    
+
     /* Draw logo area */
     int cx = framebuffer.width / 2;
     int cy = framebuffer.height / 2 - 50;
-    
+
     /* Simple "Vib-OS" text */
     fb_fill_rect(cx - 60, cy - 30, 120, 60, 0x89B4FA);  /* Blue box */
     fb_draw_string(cx - 28, cy - 4, "Vib-OS", 0xFFFFFF, 0x89B4FA);
-    
+
     /* Boot message */
     fb_draw_string(cx - 60, cy + 50, "ARM64 Operating System", 0xCDD6F4, 0x1E1E2E);
     fb_draw_string(cx - 40, cy + 70, "Booting...", 0x808080, 0x1E1E2E);
@@ -187,22 +219,27 @@ static void virtio_write32(volatile uint8_t *base, uint32_t offset, uint32_t val
 int fb_init(void)
 {
     printk(KERN_INFO "FB: Initializing framebuffer\n");
-    
-    /* Use static buffer in BSS */
+
+    /* Use static buffers in BSS */
     static uint32_t static_framebuffer[1024 * 768] __attribute__((aligned(4096)));
-    
+    static uint32_t static_backbuffer[1024 * 768] __attribute__((aligned(4096)));
+
     framebuffer.buffer = static_framebuffer;
+    framebuffer.backbuffer = static_backbuffer;
     framebuffer.width = SIMPLE_FB_WIDTH;
     framebuffer.height = SIMPLE_FB_HEIGHT;
     framebuffer.pitch = SIMPLE_FB_WIDTH * 4;
     framebuffer.initialized = true;
-    
-    printk(KERN_INFO "FB: Framebuffer %ux%u at 0x%lx\n",
-           framebuffer.width, framebuffer.height, (unsigned long)framebuffer.buffer);
-    
-    /* Clear to dark blue */
+    framebuffer.has_backbuffer = true;
+
+    printk(KERN_INFO "FB: Framebuffer %ux%u at 0x%lx (backbuffer at 0x%lx)\n",
+           framebuffer.width, framebuffer.height,
+           (unsigned long)framebuffer.buffer,
+           (unsigned long)framebuffer.backbuffer);
+
+    /* Clear both buffers */
     fb_clear(0x1E1E2E);
-    
+
     /* Configure QEMU ramfb to display our framebuffer */
     extern int ramfb_init(uint32_t *framebuffer, uint32_t width, uint32_t height);
     if (ramfb_init(framebuffer.buffer, framebuffer.width, framebuffer.height) == 0) {
@@ -210,12 +247,15 @@ int fb_init(void)
     } else {
         printk(KERN_WARNING "FB: ramfb not available, display may not work\n");
     }
-    
-    /* Show boot splash */
+
+    /* Show boot splash (draws to backbuffer) */
     fb_show_splash();
-    
+
+    /* Present splash atomically to avoid flicker */
+    fb_present();
+
     printk(KERN_INFO "FB: Initialization complete\n");
-    
+
     return 0;
 }
 
